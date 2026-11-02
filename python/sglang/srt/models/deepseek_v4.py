@@ -197,6 +197,8 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_schedule,
+    get_serving,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -4625,6 +4627,33 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
+def dsv4_alloc_decode_batch_sizes(max_bs: int) -> list[int]:
+    """Powers of two through ``next_power_of_2(max_bs)``.
+
+    ``alloc_decode_kernel`` specializes on ``bs_upper=next_power_of_2(bs)``,
+    so a batch of 6 still needs the cubin compiled for 8.
+    """
+    from sglang.srt.utils.common import next_power_of_2
+
+    cap = next_power_of_2(max(int(max_bs), 1))
+    size = 1
+    sizes: list[int] = []
+    while size <= cap:
+        sizes.append(size)
+        size *= 2
+    return sizes
+
+
+def _warmup_requested(name: str) -> bool:
+    try:
+        raw = getattr(get_serving(), "warmups", None)
+    except ValueError:
+        return False
+    if not raw:
+        return False
+    return name in {part.strip() for part in str(raw).split(",") if part.strip()}
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4734,6 +4763,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
         self._mhc_prewarmed_at_load = False
+        self._dsv4_device_kernels_prewarmed = False
 
     @torch.inference_mode()
     def wants_prefill_autotune(self) -> bool:
@@ -5244,6 +5274,89 @@ class DeepseekV4ForCausalLM(nn.Module):
             time.perf_counter() - tic - compile_secs,
         )
 
+    def _prewarm_dsv4_device_kernels(self) -> None:
+        """Compile the long-prefill combine kernel and the decode page allocator.
+
+        ``--warmups=dsv4_device_kernels`` selects this. It runs with weight
+        loading, before the KV pool is sized, so ``--mem-fraction-static``
+        can stay high. A one-row launch compiles the same cubin as a 4096-row
+        prefill: the grid size is not a compile key. Dummy tensors are freed
+        before the pool is measured. Early returns stay rank-uniform.
+        """
+        if self._dsv4_device_kernels_prewarmed:
+            return
+        self._dsv4_device_kernels_prewarmed = True
+        if _is_npu or _is_xpu or not _warmup_requested("dsv4_device_kernels"):
+            return
+        layer = next(
+            (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
+            None,
+        )
+        if (
+            layer is None
+            or layer.hc_mult != 4
+            or layer.hidden_size != 5120
+            or layer.input_layernorm.weight.dtype != torch.bfloat16
+        ):
+            return
+
+        from sglang.kernels.ops.layernorm.hc_combine_norm import (
+            _hc_combine_norm_prefill,
+        )
+        from sglang.kernels.ops.memory.allocator import alloc_decode_kernel
+
+        device = layer.hc_attn_fn.device
+        tic = time.perf_counter()
+        eps_values = {
+            float(layer.input_layernorm.variance_epsilon),
+            float(layer.post_attention_layernorm.variance_epsilon),
+        }
+        x = torch.empty((1, 20480), dtype=torch.bfloat16, device=device)
+        pre = torch.empty((1, 4), dtype=torch.bfloat16, device=device)
+        weight = torch.empty((5120,), dtype=torch.bfloat16, device=device)
+        y = torch.empty((1, 5120), dtype=torch.bfloat16, device=device)
+        for eps in eps_values:
+            _hc_combine_norm_prefill[(1,)](
+                x,
+                pre,
+                weight,
+                y,
+                x.stride(0),
+                pre.stride(0),
+                eps,
+                num_warps=4,
+            )
+        del x, pre, weight, y
+
+        page_size = int(get_schedule().page_size or 1)
+        max_bs = int(get_schedule().max_running_requests or 1)
+        batch_sizes = dsv4_alloc_decode_batch_sizes(max_bs)
+        for bs in batch_sizes:
+            seq_lens = torch.full((bs,), page_size, dtype=torch.int64, device=device)
+            last_loc = torch.zeros((bs,), dtype=torch.int64, device=device)
+            free_pages = torch.arange(bs, dtype=torch.int64, device=device)
+            out_indices = torch.empty((bs,), dtype=torch.int64, device=device)
+            alloc_decode_kernel[(bs,)](
+                seq_lens,
+                last_loc,
+                free_pages,
+                out_indices,
+                bs,
+                page_size,
+            )
+            del seq_lens, last_loc, free_pages, out_indices
+
+        torch.cuda.synchronize()
+        compile_secs = time.perf_counter() - tic
+        torch.cuda.empty_cache()
+        get_parallel().tp_group.barrier()
+        log_info_on_rank0(
+            logger,
+            "DeepSeek V4 device kernels preloaded at load "
+            f"(hc_combine_norm_prefill, alloc_decode bs_upper={batch_sizes} "
+            f"page_size={page_size}) in {compile_secs:.1f}s",
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
@@ -5642,6 +5755,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")
             self._prewarm_mhc_kernels()
+            self._prewarm_dsv4_device_kernels()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

@@ -116,6 +116,7 @@ sglang serve \
   --trust-remote-code \
   --tp 4 \
   --mem-fraction-static 0.97 \
+  --warmups dsv4_device_kernels \
   --max-running-requests 8 \
   --cuda-graph-max-bs-decode 8
 ```
@@ -124,7 +125,7 @@ sglang serve \
 
 `lookup: auto` stays `all_reduce` with `placement: disk`. `lookup: peer_read` requires `placement: gpu` and fails at startup if it is combined with disk.
 
-On 4×84 GB cards the language weights leave little room for the SWA and KV pools, so the example above sets `--mem-fraction-static 0.97` and caps the decode batch at 8. Other GPUs should keep their own values. Disk offload does not change those three flags.
+On 4×84 GB cards the language weights leave little room for the SWA and KV pools, so the example above sets `--mem-fraction-static 0.97` and caps the decode batch at 8. Other GPUs should keep their own values. Disk offload does not change those flags. `--warmups=dsv4_device_kernels` compiles the long-prefill hyper-connection kernel and the decode page allocator while weights load, before the pool is sized. The first request then does not JIT those cubins into a full allocator. Omit the name to skip that preload.
 
 Turning disk offload on disables overlap scheduling. Decode rows are staged from the sampled tokens, and overlap leaves those tokens on the device until the next forward. Speculative decoding, including DSpark, is refused at startup.
 

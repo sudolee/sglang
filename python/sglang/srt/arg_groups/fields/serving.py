@@ -116,7 +116,12 @@ class Serving(msgspec.Struct):
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
     warmups: A[
         Optional[str],
-        "Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+        "Specify custom warmup functions (csv) to run before the server listens, "
+        "for example --warmups=warmup_name1,warmup_name2. Names are the "
+        "functions registered in warmup.py. dsv4_device_kernels is different: "
+        "DeepSeek-V4 compiles _hc_combine_norm_prefill and alloc_decode_kernel "
+        "while loading weights, before the KV pool is sized, so a high "
+        "--mem-fraction-static does not leave the first long prefill to JIT them.",
     ] = None
     enable_http2: A[
         bool,

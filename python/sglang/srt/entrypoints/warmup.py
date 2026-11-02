@@ -105,6 +105,21 @@ async def whisper_autodetect(
     logger.info("Whisper auto-detect regex FSMs compiled.")
 
 
+@warmup("dsv4_device_kernels")
+async def dsv4_device_kernels(disaggregation_mode: str, tokenizer_manager):
+    """Already compiled while DeepSeek-V4 weights loaded.
+
+    The HTTP warmup runs after the KV pool exists. Launching a 4096-token
+    request here would compile into a full allocator. The cubins are loaded
+    from ``DeepseekV4ForCausalLM.load_weights`` when this name is listed.
+    """
+    del disaggregation_mode, tokenizer_manager
+    logger.info(
+        "dsv4_device_kernels was compiled during DeepSeek-V4 weight load, "
+        "before the KV pool was sized."
+    )
+
+
 @warmup("voice_chat")
 async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
     # this warms up the fused_moe triton kernels and caches them
