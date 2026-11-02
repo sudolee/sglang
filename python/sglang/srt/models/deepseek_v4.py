@@ -5609,6 +5609,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             "attn_mqa.v_scale",
             "blockscale_swizzled",
         ]
+        from sglang.srt.layers.engram_disk import engram_disk_enabled
+
+        if engram_disk_enabled():
+            # Disk-offloaded engram tables are gathered by pread (engram_disk);
+            # the loader never reads them.
+            skipped_checking_patterns.append(".engram.embed.")
         if not self.pp_group.is_first_rank:
             skipped_checking_patterns.append("embed_tokens")
         if not self.pp_group.is_last_rank:

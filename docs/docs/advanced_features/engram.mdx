@@ -19,7 +19,7 @@ defaults:
 
 | Key | Question | Values |
 |---|---|---|
-| `placement` | Where do the rows live? | `gpu` (default): device memory. `cpu`: pinned host memory, which the GPU reads in place; the HBM goes to the KV cache. |
+| `placement` | Where do the rows live? | `gpu` (default): device memory. `cpu`: pinned host memory, which the GPU reads in place; the HBM goes to the KV cache. `disk`: the original safetensors, read with `pread` into a hot-row cache (`dir`, `cache_mib`). |
 | `replication` | How many copies are there? | `none` (default): one table, its rows split across the TP group. `per_node`: each node holds the whole table, mapped by all of its ranks. |
 | `lookup` | How does a rank get rows another rank holds? Only with `replication` `none`. | `auto` (default): `peer_read` for GPU tables whose TP group is one NVLink domain, otherwise a collective SGLang picks for each step. `all_reduce`, `reduce_scatter`, `all_to_all`: that collective (see below). `peer_read`: each rank reads its tokens' rows straight from the owning GPU's shard over NVLink, with no collective. |
 
@@ -34,6 +34,11 @@ sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 4
 # Rows in host memory, one shard per rank: frees the HBM for the KV cache.
 sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 4 \
   --engram-config '{"placement": "cpu"}'
+
+# Rows stay in a local checkpoint. dir defaults to --model-path. cache_mib is the
+# hot-row cache across all TP ranks, in MiB (default 49152; 0 is uncapped).
+sglang serve --model-path /path/to/local-checkpoint --tp-size 4 \
+  --engram-config '{"placement": "disk", "cache_mib": 49152}'
 ```
 
 ## Choosing a configuration
@@ -59,6 +64,9 @@ and decode (1 to 1,024 tokens per rank, in CUDA graphs):
   slower.
 
 Otherwise (host tables, or GPUs without NVLink between them) it picks a collective.
+`placement` `disk` is the exception: `auto` stays `all_reduce` and does not become
+`peer_read`. An explicit `peer_read` requires `placement` `gpu` and fails at startup
+with disk.
 
 Under DP attention, every rank needs rows for its own tokens, but each table is split across the
 TP group. The lookup gathers every rank's hash ids, looks up rows, and exchanges them:
@@ -98,6 +106,10 @@ all-reduce.
   namespace. This mapping usually gets no huge pages unless shmem transparent huge pages are on.
 - **`lookup` `reduce_scatter` or `all_to_all`**: DP attention on CUDA; `all_to_all` also needs the
   hash columns to divide over `--tp-size`.
+- **`placement` `disk`**: a local safetensors checkpoint (`dir`, or `--model-path`). Each
+  rank preads its own rows. `cache_mib` caps the hot-row cache across the TP group
+  (default 49152; `0` keeps every row read until allocation fails). Overlap scheduling
+  is turned off, and speculative decoding is refused. `lookup` `auto` stays `all_reduce`.
 - **`lookup` `peer_read`**: CUDA with peer access between the GPUs (POSIX handles within a node,
   fabric handles across an NVLink domain); `auto` takes it only over NVLink. Each GPU holds
   `1 / tp_size` of the table. With TP1 there is no peer, and the setting has no effect.

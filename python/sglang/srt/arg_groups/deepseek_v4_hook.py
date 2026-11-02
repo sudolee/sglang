@@ -18,6 +18,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
+    _engram_disk_offload_disables_overlap,
     declare_resolution,
     model_config_of,
     resolved_view,
@@ -77,11 +78,12 @@ _DEPRECATED_ENGRAM_ENVS = (
 
 
 def _engram_config_from_env(cfg) -> EngramConfig:
-    if (
+    peer = (
         envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.get()
         and cfg.tp_size > 1
         and get_platform().is_cuda
-    ):
+    )
+    if peer:
         return EngramConfig(lookup=EngramLookup.PEER_READ)
     if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
         shared = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get() == "shared"
@@ -164,6 +166,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
     _resolve_engram_config(server_args)
+    run_post_process_pass(server_args, _engram_disk_offload_disables_overlap)
 
     if cfg.dsv4_attn_backend == "auto":
         declare_resolution(

@@ -931,6 +931,31 @@ def _sparse_head_overlap_disable(view: Any) -> dict:
     return {}
 
 
+def _engram_config_requests_disk(view: Any) -> bool:
+    """placement disk, from the resolved config or the raw --engram-config JSON."""
+    cfg = getattr(view, "engram_config", None)
+    if isinstance(cfg, dict):
+        return cfg.get("placement") == "disk"
+    return getattr(cfg, "placement", None) == "disk"
+
+
+@register_post_process
+def _engram_disk_offload_disables_overlap(view: Any) -> dict:
+    """Engram disk offload stages decode rows at schedule time from the
+    previous batch's sampled tokens; overlap scheduling resolves those tokens
+    on the device only (FutureMap), so the scheduler would stage stale windows."""
+    disk = _engram_config_requests_disk(view)
+    if disk:
+        logger.warning(
+            "Engram disk offload disables overlap scheduling: decode rows are "
+            "staged at schedule time from the sampled tokens, which overlap "
+            "resolves on the device only. mem_fraction_static, "
+            "max_running_requests, and cuda_graph_max_bs_decode are left as set."
+        )
+        return {"disable_overlap_schedule": True}
+    return {}
+
+
 # Architectures with explicit FlashInfer AllReduce Fusion support. Keep in
 # sync with the model-side fusion implementations.
 _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(

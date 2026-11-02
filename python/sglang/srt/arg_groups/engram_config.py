@@ -8,7 +8,8 @@ from typing import Any, Dict, Optional
 class EngramPlacement:
     GPU = "gpu"
     CPU = "cpu"
-    ALL = (GPU, CPU)
+    DISK = "disk"
+    ALL = (GPU, CPU, DISK)
 
 
 class EngramReplication:
@@ -42,13 +43,34 @@ class EngramConfig:
     placement: str = _choice(EngramPlacement.GPU, EngramPlacement.ALL)
     replication: str = _choice(EngramReplication.NONE, EngramReplication.ALL)
     lookup: str = _choice(EngramLookup.AUTO, EngramLookup.ALL)
+    # Checkpoint directory for placement "disk". Empty uses --model-path.
+    dir: str = ""
+    # Hot-row cache across all TP ranks, in MiB. 0 grows until allocation fails.
+    cache_mib: int = 49152
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "EngramConfig":
+        raw = dict(raw)
         if raw.get("lookup") == EngramLookup.COLLECTIVE:
-            raw = {**raw, "lookup": EngramLookup.AUTO}
-        choices = {f.name: f.metadata["choices"] for f in dataclasses.fields(cls)}
-        invalid = [f"{k}={v!r}" for k, v in raw.items() if v not in choices.get(k, ())]
+            raw["lookup"] = EngramLookup.AUTO
+        choices = {
+            f.name: f.metadata["choices"]
+            for f in dataclasses.fields(cls)
+            if "choices" in f.metadata
+        }
+        known = {f.name for f in dataclasses.fields(cls)}
+        invalid = []
+        for key, value in raw.items():
+            if key not in known:
+                invalid.append(f"{key}={value!r}")
+            elif key in choices and value not in choices[key]:
+                invalid.append(f"{key}={value!r}")
+            elif key == "dir" and not isinstance(value, str):
+                invalid.append(f"{key}={value!r}")
+            elif key == "cache_mib" and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                invalid.append(f"{key}={value!r}")
         if invalid:
             raise ValueError(
                 f"--engram-config: invalid {', '.join(invalid)}; choices: {choices}"
@@ -68,5 +90,13 @@ class EngramConfig:
         ):
             raise ValueError(
                 "--engram-config: replication 'per_node' needs placement 'cpu'."
+            )
+        if config.placement == EngramPlacement.DISK and config.lookup not in (
+            EngramLookup.AUTO,
+            EngramLookup.ALL_REDUCE,
+        ):
+            raise ValueError(
+                "--engram-config: placement 'disk' only supports lookup 'auto' "
+                "or 'all_reduce'."
             )
         return config

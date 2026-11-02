@@ -103,7 +103,32 @@ import { agentx } from "/src/snippets/agentx/deepseek-ai/deepseek-v4_1.jsx";
 
 **Sparse retrieval.** KV source layers and index source layers are different lists — four of the former, eight of the latter. The four extra index layers produce no keys at all; they re-score layer 20's keys with their own query, so retrieval decisions are made twice as often as keys are stored. Each retrieving layer picks a top-512 candidate set.
 
-**Engram.** An additive n-gram hash memory at two layers. Token ids are normalized *before* hashing, so `" The"`, `"the"` and `"THE"` cannot fork into separate rows. Its two fp8 tables are the largest single block of weight in the checkpoint, and by default they load row-sharded across the TP group in GPU memory, which costs a collective per engram layer. `--engram-config` chooses where they live: `'{"placement": "cpu"}'` moves them to host memory, one huge-page-backed shard per rank, so the freed HBM goes to the KV pool, at the cost of host RAM and a longer load; `'{"lookup": "peer_read"}'` keeps them on the GPUs and reads each row from the GPU that holds it, with no collective. Output is bitwise unchanged either way; see [Engram tables](/docs/advanced_features/engram) for the trade-offs and the deprecated environment variables this replaces.
+**Engram.** An additive n-gram hash memory at two layers. Token ids are normalized *before* hashing, so `" The"`, `"the"` and `"THE"` cannot fork into separate rows. Its two fp8 tables are the largest single block of weight in the checkpoint, and by default they load row-sharded across the TP group in GPU memory, which costs a collective per engram layer. `--engram-config` chooses where they live: `'{"placement": "cpu"}'` moves them to host memory, one huge-page-backed shard per rank, so the freed HBM goes to the KV pool, at the cost of host RAM and a longer load; `'{"lookup": "peer_read"}'` keeps them on the GPUs and reads each row from the GPU that holds it, with no collective. Output is bitwise unchanged either way; see [Engram tables](/docs/advanced_features/engram) for the trade-offs and the deprecated environment variables this replaces. When neither HBM nor host RAM can hold the tables, use [Engram disk offload](#engram-disk-offload).
+
+### Engram disk offload
+
+Leave the two Engram tables in a local safetensors checkpoint and read each batch's rows from disk. This is the fallback when the tables fit neither in GPU memory nor in host RAM. Prefer `--engram-config '{"placement": "cpu"}'` when host RAM is available: that lookup stays on the GPU and keeps overlap scheduling.
+
+```bash Command
+sglang serve \
+  --model-path /path/to/local-checkpoint \
+  --engram-config '{"placement": "disk", "dir": "/path/to/local-checkpoint", "cache_mib": 49152}' \
+  --trust-remote-code \
+  --tp 4 \
+  --mem-fraction-static 0.97 \
+  --max-running-requests 8 \
+  --cuda-graph-max-bs-decode 8
+```
+
+`placement: disk` leaves the tables in the checkpoint. `dir` is a local checkpoint directory (`model.safetensors.index.json` plus shards, or a single `model.safetensors`), not a Hugging Face repo id; omit it to use `--model-path`. Each machine in a multi-node run needs its own copy. `cache_mib` is the hot-row cache across all TP ranks, in MiB. The default is `49152` (48 GiB total, split across ranks). Startup logs the per-rank size. `0` keeps every row this process reads until allocation fails; it does not stop at free RAM.
+
+`lookup: auto` stays `all_reduce` with `placement: disk`. `lookup: peer_read` requires `placement: gpu` and fails at startup if it is combined with disk.
+
+On 4×84 GB cards the language weights leave little room for the SWA and KV pools, so the example above sets `--mem-fraction-static 0.97` and caps the decode batch at 8. Other GPUs should keep their own values. Disk offload does not change those three flags.
+
+Turning disk offload on disables overlap scheduling. Decode rows are staged from the sampled tokens, and overlap leaves those tokens on the device until the next forward. Speculative decoding, including DSpark, is refused at startup.
+
+`--load-format` may be `auto`, `safetensors`, `fastsafetensors`, or `runai_streamer`. The loader does not materialize tensors whose names contain `.engram.embed.`. `config.json` must still carry the Engram fields (`engram_layer_ids` and the table sizes). A quantized checkpoint that dropped them will serve without Engram, and disk offload then has nothing to map.
 
 **SWA bounded replay.** Decoder SWA bounded replay runs the early layers over the whole extend and the late layers over only each request’s last 128 tokens, sharing late-layer KV from source layer 20. It defaults on for supported CUDA/HIP configurations without context parallelism, including both PD roles on CUDA. Encoder SWA replay can be combined with decoder replay, subject to encoder-specific validation. Eager and breakable prefill are supported; full prefill graphs keep it disabled. With DP attention, automatic enablement requires attention TP 1 and the `none` or `megamoe` MoE backend on CUDA, or `none` on HIP. Use `--enable-decoder-swa-bounded-replay` to explicitly enable replay, subject to compatibility validation. Bounded replay is not numerically equivalent to full prefill. A request for prompt logprobs or for every hidden state runs its whole prompt through the late layers with full sliding windows; other requests, including their output-token logprobs, use the bounded computation. Use `--no-enable-decoder-swa-bounded-replay` to retain full prefill, for example for RL rollouts whose logprobs must match the trainer.
 

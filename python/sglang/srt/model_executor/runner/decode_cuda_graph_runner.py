@@ -1196,6 +1196,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
+        # Disk-offloaded engram tables: capture the dequant reading the stager's
+        # static buffers; the scheduler refills them before every replay.
+        ngram_manager = getattr(self.model_runner, "ngram_embedding_manager", None)
+        stager = ngram_manager.engram_stager if ngram_manager is not None else None
+        if stager is not None and forward_batch.forward_mode.is_decode():
+            staged = stager.static_staged_rows(bs)
+            if staged is not None:
+                forward_batch.engram_staged_rows = staged
+
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:

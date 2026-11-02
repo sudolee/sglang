@@ -11,11 +11,14 @@ import dataclasses
 import errno
 import functools
 import glob
+import json
 import logging
 import mmap
 import os
 import re
+import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import msgspec
@@ -81,6 +84,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_serving,
+    get_spec,
 )
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
@@ -817,6 +821,81 @@ class _HostTable:
             logger.info(msg)
 
 
+from sglang.srt.layers.engram_disk import (
+    CheckpointTable as _CheckpointTable,
+    disk_config as _disk_config,
+    unpack_fp4_rows as _unpack_fp4_rows,
+)
+
+
+_ENGRAM_DISK_LOAD_FORMATS = frozenset(
+    {"auto", "safetensors", "fastsafetensors", "runai_streamer"}
+)
+
+
+def engram_disk_supported_load_format(load_format: object) -> bool:
+    """Formats whose readers skip ``.engram.embed.*`` instead of materializing it."""
+    fmt = str(load_format).lower().rsplit(".", 1)[-1]
+    return fmt in _ENGRAM_DISK_LOAD_FORMATS
+
+
+def reject_engram_disk_speculative(algorithm: object) -> None:
+    """Target-verify reads the table inside a captured CUDA graph."""
+    if algorithm is not None:
+        raise ValueError(
+            "engram disk offload does not support speculative decoding: "
+            "target-verify reads the table inside captured CUDA graphs"
+        )
+
+
+def _engram_checkpoint_dir() -> str:
+    """The directory the disk tables are read from (dir, else --model-path)."""
+    config = _disk_config()
+    path = config.dir if config is not None else ""
+    if not path:
+        try:
+            path = getattr(get_model(), "model_path", "") or ""
+        except Exception:
+            path = ""
+    if not os.path.isdir(path):
+        raise ValueError(
+            f"engram disk offload path {path!r} is not a directory; set "
+            "--engram-config dir or --model-path to a local safetensors "
+            "checkpoint (fast NVMe recommended)"
+        )
+    return path
+
+
+_DISK_GATHER_THREADS = 16
+
+
+@functools.cache
+def _disk_gather_pool() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(_DISK_GATHER_THREADS)
+
+
+def _gather_table_rows(table: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """table's rows ``ids`` gathered on the CPU into a pinned buffer. fp8 and
+    e8m0 have no CPU index_select, so callers pass uint8 views of them."""
+    n = ids.numel()
+    out = torch.empty((n, table.shape[1]), dtype=table.dtype, pin_memory=True)
+    chunks = min(_DISK_GATHER_THREADS, -(-n // 4096))
+    if chunks <= 1:
+        torch.index_select(table, 0, ids, out=out)
+        return out
+    step = -(-n // chunks)
+    pool = _disk_gather_pool()
+    pending = [
+        pool.submit(
+            torch.index_select, table, 0, ids[i : i + step], out=out[i : i + step]
+        )
+        for i in range(0, n, step)
+    ]
+    for p in pending:
+        p.result()
+    return out
+
+
 class _PeerShards:
     """One rank's engram row shard in exportable device memory (CUDA VMM), with
     every TP peer's shard mapped into this process after `connect`.
@@ -969,6 +1048,14 @@ def resolve_engram_config(columns: int) -> EngramConfig:
     per process, at model construction, when the parallel layout and the GPUs are
     known; the result is recorded in the config so later layers read it."""
     config = get_exec().offload.engram_config or EngramConfig()
+    # Disk rows are reassembled by all-reduce. auto must not become peer_read
+    # or all_to_all; an explicit peer_read is rejected when the config is parsed.
+    if config.placement == EngramPlacement.DISK:
+        if config.lookup == EngramLookup.AUTO:
+            config = dataclasses.replace(config, lookup=EngramLookup.ALL_REDUCE)
+            get_context().override("resolve_engram_config", engram_config=config)
+            logger.info("Engram lookup auto -> %s", config.lookup)
+        return config
     if config.lookup != EngramLookup.AUTO:
         return config
     parallel = get_parallel()
@@ -1038,9 +1125,10 @@ class EngramEmbedding(nn.Module):
 
     Rows are sharded over the TP group in device memory, aligned to the hash
     columns where they divide evenly (`shard_range`); --engram-config can read
-    the peers' shards in place or keep the rows in host memory instead, as one
-    shard per rank or one copy per node (see _HostTable). Loading is sharded
-    in every layout: a rank writes only its own row range.
+    the peers' shards in place, keep the rows in host memory (see _HostTable),
+    or leave the tables in the checkpoint and pread each batch
+    (placement disk, see engram_disk). Loading is sharded in every layout: a
+    rank writes only its own row range.
     """
 
     def __init__(
@@ -1059,6 +1147,7 @@ class EngramEmbedding(nn.Module):
         )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
+        self.disk_table: Optional[_CheckpointTable] = None
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
@@ -1070,6 +1159,8 @@ class EngramEmbedding(nn.Module):
             weight, scale = self.peer.views()
             self.weight = nn.Parameter(weight, requires_grad=False)
             self.scale = nn.Parameter(scale, requires_grad=False)
+        elif config.placement == EngramPlacement.DISK:
+            self._init_disk_table(num_embeddings, dim, layer_id)
         elif config.placement == EngramPlacement.CPU:
             self._init_host_table(num_embeddings, dim, layer_id, config.replication)
         else:
@@ -1108,6 +1199,30 @@ class EngramEmbedding(nn.Module):
         self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
         self._sort_host_reads = _sorted_host_reads(torch.cuda.current_device())
 
+    def _init_disk_table(self, num_embeddings: int, dim: int, layer_id: int):
+        if not is_cuda():
+            raise ValueError("engram disk offload requires CUDA")
+        try:
+            load_format = get_model().load_format
+        except AttributeError:
+            load_format = "auto"
+        if not engram_disk_supported_load_format(load_format):
+            raise ValueError(
+                "engram disk offload maps the tables from safetensors files; "
+                f"load_format={load_format!r} is not supported"
+            )
+        reject_engram_disk_speculative(get_spec().speculative_algorithm)
+        self.disk_table = _CheckpointTable(layer_id, num_embeddings, dim)
+        # Row-less placeholders; finish_load maps the checkpoint rows into them
+        # and the weight iterator never reads them (weight_utils).
+        self.weight = nn.Parameter(
+            torch.empty(0, dim, dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        self.scale = nn.Parameter(
+            torch.empty(0, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu),
+            requires_grad=False,
+        )
+
     @property
     def _shared(self) -> bool:
         return (
@@ -1120,10 +1235,16 @@ class EngramEmbedding(nn.Module):
         """The shared host layout (every row mapped here) on a GPU without ATS."""
         return self._shared and self._sort_host_reads
 
+    @property
+    def cpu_stageable(self) -> bool:
+        """The scheduler's EngramRowStager can gather this table's rows on the
+        host: the shared host table without ATS, or a disk table."""
+        return self.shared_host_table_without_ats or self.disk_table is not None
+
     def enable_scheduler_staging(self) -> None:
         """Read the rows the scheduler stages (EngramRowStager) instead of
         gathering them in the forward."""
-        assert self.shared_host_table_without_ats
+        assert self.cpu_stageable
         self.staged_by_scheduler = True
 
     def _table_ptrs(self) -> tuple[int, int]:
@@ -1132,8 +1253,14 @@ class EngramEmbedding(nn.Module):
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self.disk_table is not None and not self.disk_table.ready:
+            # Disk tables are mapped from the checkpoint in finish_load and the
+            # weight iterators skip them; a loader that still yields them must
+            # not copy into the row-less placeholders.
+            return
         rows = slice(self.row_start, self.row_start + self.rows)
-        if self._shared:
+        if self._shared or self.disk_table is not None:
+            # The full table is mapped here; write only this rank's row range.
             param.data[rows].copy_(loaded_weight[rows])
         else:
             param.data.copy_(loaded_weight[rows])
@@ -1141,12 +1268,15 @@ class EngramEmbedding(nn.Module):
             self.host_table.dirty = True
 
     def finish_load(self, label: str):
-        """Collective in the shared layout and with peer shards: every rank calls
+        """Collective in the shared layouts and with peer shards: every rank calls
         it after loading."""
         if self.peer is not None:
             self.peer.connect(self.row_start, label)
         if self.host_table is not None:
             self.host_table.finish_load(label)
+        if self.disk_table is not None and not self.disk_table.ready:
+            self.disk_table.bind_shard(self.row_start, self.rows, self.tp_size)
+            self.disk_table.map(_engram_checkpoint_dir())
 
     def forward(
         self,
@@ -1192,15 +1322,18 @@ class EngramEmbedding(nn.Module):
         self,
         rows: torch.Tensor,
         scales: torch.Tensor,
-        copied: torch.cuda.Event,
+        copied: Optional[torch.cuda.Event],
         hash_shape: torch.Size,
     ) -> torch.Tensor:
         """Dequantize this layer's staged rows into [*hash_shape, dim]; rows past the
-        staged ones (prefill graph padding) are zero."""
+        staged ones (prefill graph padding) are zero. ``copied`` is None for the
+        static decode buffers, whose H2D the schedule-stream fence has already
+        ordered before this forward."""
         stream = torch.cuda.current_stream()
-        stream.wait_event(copied)
-        rows.record_stream(stream)
-        scales.record_stream(stream)
+        if copied is not None:
+            stream.wait_event(copied)
+            rows.record_stream(stream)
+            scales.record_stream(stream)
         out = torch.empty(
             *hash_shape, self.dim, dtype=torch.bfloat16, device=rows.device
         )
@@ -1214,6 +1347,46 @@ class EngramEmbedding(nn.Module):
             self.dim,
             FP8_BLOCK_SIZE,
             row_hi=rows.shape[0],
+        )
+        # Gather leaves padding untouched. The shard all-reduce sums every
+        # element, so padding has to be zero on every rank.
+        if rows.shape[0] < flat.shape[0]:
+            flat[rows.shape[0] :].zero_()
+        return out
+
+    def _disk_owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """Rows of `indices` this rank's shard holds. Owned ids come from the
+        hot-row cache or one coalesced pread; unowned ids stay zero so the
+        sharded all-reduce can reassemble the row."""
+        ids = indices.reshape(-1).cpu()
+        owned = torch.where(
+            (ids >= self.row_start) & (ids < self.row_start + self.rows),
+            ids,
+            torch.full_like(ids, -1),
+        )
+        uniq, inverse = torch.unique(owned, sorted=True, return_inverse=True)
+        skip = int(uniq.numel() > 0 and uniq[0] < 0)
+        rows = uniq[skip:]
+        weight, scale = self.disk_table.gather(rows)
+        if self.disk_table.packed:
+            unpacked = torch.empty(
+                weight.shape[0], weight.shape[1] * 2, dtype=torch.uint8,
+                pin_memory=True,
+            )
+            weight = _unpack_fp4_rows(weight, out=unpacked)
+        device = indices.device
+        weight = weight.to(device, non_blocking=True)
+        scale = scale.to(device, non_blocking=True)
+        compact = (inverse - skip).to(device)
+        out = self.new_rows(indices)
+        engram_gather(
+            weight.data_ptr(),
+            scale.data_ptr(),
+            compact,
+            out.view(-1, self.dim),
+            self.dim,
+            FP8_BLOCK_SIZE,
+            row_hi=rows.numel(),
         )
         return out
 
@@ -1246,6 +1419,8 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self.new_rows(indices).zero_()
+        if self.disk_table is not None:
+            return self._disk_owned_rows(indices)
         if self.host_table is None and not _cuda_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
@@ -1525,9 +1700,13 @@ class Engram(nn.Module):
         """The rows the scheduler staged for this batch, else the table lookup."""
         staged = None if forward_batch is None else forward_batch.engram_staged_rows
         if staged is not None:
-            return self.embed.dequant_staged(
+            values = self.embed.dequant_staged(
                 *staged[self.layer_hash_index], hash_ids.shape
             )
+            # Disk staging stores only this rank's shard (zeros elsewhere).
+            if self.embed.disk_table is not None and self.embed.tp_size > 1:
+                values = self.embed._reduce_owned_rows(values)
+            return values
         return self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
 
 

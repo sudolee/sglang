@@ -74,7 +74,10 @@ class NgramEmbeddingManager:
                 from sglang.srt.layers.engram_staging import EngramRowStager
 
                 engram_stager = EngramRowStager.from_model(
-                    model, engram_hasher, torch.device(device)
+                    model,
+                    engram_hasher,
+                    torch.device(device),
+                    max_running_requests=max_running_requests,
                 )
         return cls(
             enabled=use_ngram_embedding,
