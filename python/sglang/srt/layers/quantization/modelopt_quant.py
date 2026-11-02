@@ -2553,6 +2553,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if (
             self.enable_flashinfer_trtllm_moe
             or get_moe_runner_backend().is_flashinfer_megamoe()
+            # deep_gemm retransforms the canonical scales after loading and
+            # cutlass re-swizzles them in process_weights_after_loading, so
+            # neither reads the create-time swizzle. On 84GB cards the extra
+            # copy is what makes layer construction exceed the GPU.
+            or get_moe_runner_backend().is_deep_gemm()
+            or get_moe_runner_backend().is_flashinfer_cutlass()
         ):
             layer.w13_blockscale_swizzled = None
         else:
@@ -2576,6 +2582,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if (
             self.enable_flashinfer_trtllm_moe
             or get_moe_runner_backend().is_flashinfer_megamoe()
+            or get_moe_runner_backend().is_deep_gemm()
+            or get_moe_runner_backend().is_flashinfer_cutlass()
         ):
             layer.w2_blockscale_swizzled = None
         else:

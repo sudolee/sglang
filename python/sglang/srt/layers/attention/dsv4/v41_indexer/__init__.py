@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 
 from .full_topk import FullTopKIndexer
@@ -71,7 +72,9 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=(
+            is_sm100_or_newer() and envs.SGLANG_DSV4_INDEXER_DEEP_GEMM_DECODE.get()
+        ),
     )
 
 
