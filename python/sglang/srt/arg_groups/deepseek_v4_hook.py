@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
+    _engram_disk_offload_disables_overlap,
     declare_resolution,
     model_config_of,
     resolved_view,
@@ -81,6 +82,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # its legacy slot.
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
+    run_post_process_pass(server_args, _engram_disk_offload_disables_overlap)
 
     if cfg.dsv4_attn_backend == "auto":
         declare_resolution(

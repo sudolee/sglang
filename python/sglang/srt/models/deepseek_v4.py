@@ -5615,6 +5615,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             "attn_mqa.v_scale",
             "blockscale_swizzled",
         ]
+        if (
+            envs.SGLANG_ENABLE_DSV41_ENGRAM_DISK.get()
+            or envs.SGLANG_DSV41_ENGRAM_DISK_DIR.get()
+        ):
+            # Disk-offloaded engram tables are gathered by pread (engram_disk);
+            # the loader never reads them.
+            skipped_checking_patterns.append(".engram.embed.")
         if not self.pp_group.is_first_rank:
             skipped_checking_patterns.append("embed_tokens")
         if not self.pp_group.is_last_rank:

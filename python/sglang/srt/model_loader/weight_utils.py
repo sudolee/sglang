@@ -1143,6 +1143,81 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+_ENGRAM_DISK_KEY = ".engram.embed."
+_mmap_bypass_logged = False
+
+
+def _engram_disk_offload_active() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(
+        envs.SGLANG_ENABLE_DSV41_ENGRAM_DISK.get()
+        or envs.SGLANG_DSV41_ENGRAM_DISK_DIR.get()
+    )
+
+
+def _skip_engram_disk_table(name: str) -> bool:
+    """Engram tables under disk offload are mapped straight from the checkpoint
+    (engram_disk.CheckpointTable). Reading them here would pull them whole into
+    memory and defeat the offload."""
+    return _engram_disk_offload_active() and _ENGRAM_DISK_KEY in name
+
+
+def _safetensors_tensor_names(path: str) -> List[str]:
+    """Header keys only. Does not read tensor bytes."""
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    return [key for key in header if key != "__metadata__"]
+
+
+def _shard_contains_engram_disk_table(path: str) -> bool:
+    if not _engram_disk_offload_active():
+        return False
+    return any(_ENGRAM_DISK_KEY in name for name in _safetensors_tensor_names(path))
+
+
+def _note_engram_mmap_bypass() -> None:
+    global _mmap_bypass_logged
+    if _mmap_bypass_logged:
+        return
+    _mmap_bypass_logged = True
+    logger.warning(
+        "Engram disk offload keeps .engram.embed.* in the checkpoint. "
+        "Those tensors are not read into RAM, including when "
+        "--weight-loader-disable-mmap is set."
+    )
+
+
+def _iter_safetensors_tensors(
+    st_file: str, disable_mmap: bool
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Yield tensors from one shard, never materializing engram disk tables.
+
+    A full ``read()`` + ``safetensors.torch.load`` would pull every tensor in
+    the shard, so a shard that holds an engram table is always opened with
+    ``safe_open`` and those keys are skipped.
+    """
+    if _shard_contains_engram_disk_table(st_file):
+        if disable_mmap:
+            _note_engram_mmap_bypass()
+        with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                if _skip_engram_disk_table(name):
+                    continue
+                yield name, f.get_tensor(name)
+        return
+    if disable_mmap:
+        with open(st_file, "rb") as f:
+            result = safetensors.torch.load(f.read())
+        for name in sorted(result):
+            yield name, result[name]
+        return
+    with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+        for name in f.keys():
+            yield name, f.get_tensor(name)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
@@ -1168,15 +1243,7 @@ def safetensors_weights_iterator(
         bar_format=BAR_FORMAT,
         position=tqdm._get_free_pos(),
     ):
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-                for name in sorted(result.keys()):
-                    yield name, result[name]
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                for name in f.keys():
-                    yield name, f.get_tensor(name)
+        yield from _iter_safetensors_tensors(st_file, disable_mmap)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
     if prefetch_handle is not None:
@@ -1307,19 +1374,32 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device, nogds=not enable_gds)
-        rank_file_map = {i: [f] for i, f in enumerate(f_list)}
-        loader.add_filenames(rank_file_map)
-        try:
-            fb = loader.copy_files_to_device()
-            keys = list(fb.key_to_rank_lidx.keys())
-            for k in keys:
-                t = fb.get_tensor(k)
-                yield k, t
-        finally:
-            loader.close()
+        # copy_files_to_device uploads every tensor in the file. Shards that
+        # hold an engram table are read with safe_open instead, on every rank,
+        # so the collective below only sees files with no engram table.
+        engram_files = [f for f in f_list if _shard_contains_engram_disk_table(f)]
+        plain_files = [f for f in f_list if f not in engram_files]
+        for st_file in engram_files:
+            yield from _iter_safetensors_tensors(st_file, disable_mmap=False)
+        if plain_files:
+            loader = SafeTensorsFileLoader(pg, device, nogds=not enable_gds)
+            rank_file_map = {i: [f] for i, f in enumerate(plain_files)}
+            loader.add_filenames(rank_file_map)
+            try:
+                fb = loader.copy_files_to_device()
+                keys = list(fb.key_to_rank_lidx.keys())
+                for k in keys:
+                    if _skip_engram_disk_table(k):
+                        continue
+                    t = fb.get_tensor(k)
+                    yield k, t
+            finally:
+                loader.close()
+            if drop_cache_after_load:
+                for loaded_file in rank_file_map.get(rank, []):
+                    _drop_file_cache_after_load(loaded_file)
         if drop_cache_after_load:
-            for loaded_file in rank_file_map.get(rank, []):
+            for loaded_file in engram_files:
                 _drop_file_cache_after_load(loaded_file)
 
 
@@ -1347,13 +1427,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     )
 
     def _load_file(st_file: str):
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-        return result
+        return dict(_iter_safetensors_tensors(st_file, disable_mmap))
 
     # Sliding window: max_workers loading + 1 prefetched.
     buffer_size = max_workers + 1
@@ -1664,6 +1738,16 @@ def runai_safetensors_weights_iterator(
     hf_weights_files: List[str], is_distributed: bool = False, device: str = "cpu"
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
+    if _engram_disk_offload_active():
+        # The streamer reads every tensor it is given. Fall back to safe_open
+        # so .engram.embed.* stays in the checkpoint.
+        logger.warning(
+            "Engram disk offload skips RunAI streaming and reads safetensors "
+            "with safe_open, so .engram.embed.* is not materialized."
+        )
+        yield from safetensors_weights_iterator(hf_weights_files)
+        return
+
     from runai_model_streamer import SafetensorsStreamer
 
     enable_tqdm = (
@@ -1692,6 +1776,8 @@ def runai_safetensors_weights_iterator(
         )
 
         for name, tensor in tensor_iter:
+            if _skip_engram_disk_table(name):
+                continue
             setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
             # Views and detach() share storage but do not inherit tensor attributes.
             setattr(tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, True)

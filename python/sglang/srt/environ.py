@@ -1814,6 +1814,19 @@ class Envs:
     # a rank reads its own tokens' rows from the owning shard, with no id gather
     # and no reduce-scatter. Takes precedence over the host table.
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
+    # Offload the engram tables to disk. Switch: SGLANG_ENABLE_DSV41_ENGRAM_DISK
+    # (or a non-empty SGLANG_DSV41_ENGRAM_DISK_DIR). Path: DIR, empty = --model-path.
+    # Rows are pread from the original safetensors (no sidecar export); the loader
+    # never materializes the tables; posix_fadvise(DONTNEED) keeps them off RAM.
+    # Takes precedence over the host table; peer shards take precedence over it.
+    # Incompatible with speculative decoding; disables overlap scheduling.
+    SGLANG_ENABLE_DSV41_ENGRAM_DISK = EnvBool(False)
+    SGLANG_DSV41_ENGRAM_DISK_DIR = EnvStr("")
+    # Total hot-row cache across TP ranks, in MiB. Read only while Engram disk
+    # offload is on. The default, 49152, is a hard cap split across TP ranks.
+    # Set 0 to keep every row this rank reads; that grows until allocation
+    # fails and does not stop at free RAM.
+    SGLANG_DSV41_ENGRAM_DISK_CACHE_MIB = EnvInt(49152)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
