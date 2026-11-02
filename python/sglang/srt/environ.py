@@ -1827,6 +1827,11 @@ class Envs:
     # Set 0 to keep every row this rank reads; that grows until allocation
     # fails and does not stop at free RAM.
     SGLANG_DSV41_ENGRAM_DISK_CACHE_MIB = EnvInt(49152)
+    # Decode top-k of the DSV4.1 full indexer through DeepGEMM's
+    # fp8_fp4_paged_mqa_logits. On sm_120 the paged metadata reaches the
+    # kernel on the CPU (layout.hpp t.is_cuda()); turn this off to fall back
+    # to the torch / deep-select decode path.
+    SGLANG_DSV4_INDEXER_DEEP_GEMM_DECODE = EnvBool(True)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
